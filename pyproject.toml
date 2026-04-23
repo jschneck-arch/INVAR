@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "invar"
+version = "0.1.0"
+description = "INVAR — Invariant Architecture Runtime: domain-agnostic telemetry substrate with information-theoretic physics"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+
+keywords = [
+    "invariant", "knowledge-graph", "information-theory", "entropy",
+    "telemetry", "field-theory", "observation", "red-team"
+]
+
+dependencies = [
+    "pyyaml",
+    "numpy",
+]
+
+[project.optional-dependencies]
+redteam = []
+all     = []
+
+[project.urls]
+Repository = "https://github.com/jschneck-arch/INVAR"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: slow integration tests",
+    "live: requires a live network target",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["invar*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.json", "*.md"]
