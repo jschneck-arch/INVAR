@@ -89,12 +89,16 @@ class OperationPrimitive:
 # Ordered: more-specific / longer patterns before those that are substrings of
 # them.  LATERAL before EXECUTION avoids "psexec"→EXECUTION false match.
 # PERSISTENCE before EXECUTION avoids "autorun"→EXECUTION false match.
+# DISCOVERY before EXECUTION: "discover" must precede short patterns like "exec"
+# that could match substrings of discovery gate_ids.
+# "ps" removed from EXECUTION — too short, causes false matches on "groups",
+# "https", etc.  PowerShell gate_ids use "exec_" prefix, which "exec" catches.
 _ARTIFACT_RULES: List[Tuple[Tuple[str, ...], str]] = [
     (("psexec", "wmiexec", "smb", "winrm", "pivot", "lateral"), ArtifactType.LATERAL_ARTIFACT),
     (("persist", "autorun", "svc", "schtask"),                   ArtifactType.PERSISTENCE_ARTIFACT),
-    (("exec", "run", "ps", "cmd"),                               ArtifactType.EXECUTION_ARTIFACT),
-    (("cred", "hash", "ticket", "token"),                        ArtifactType.CREDENTIAL_ARTIFACT),
     (("enum", "scan", "recon", "discover"),                      ArtifactType.DISCOVERY_ARTIFACT),
+    (("exec", "run", "cmd", "powershell"),                       ArtifactType.EXECUTION_ARTIFACT),
+    (("cred", "hash", "ticket", "token"),                        ArtifactType.CREDENTIAL_ARTIFACT),
     (("loot", "collect", "exfil"),                               ArtifactType.COLLECTION_ARTIFACT),
     (("beacon", "c2", "callback", "channel"),                    ArtifactType.C2_ARTIFACT),
 ]
