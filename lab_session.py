@@ -2,45 +2,50 @@
 lab_session.py — Invar lab engagement session
 ==============================================
 Invar drives the engagement.  The operator is a second observer who can
-inject additional tool output or redirect at any point.
+inject additional tool output, redirect phases, or feed post-exploitation
+results at any point.
+
+Both network tool output (nmap, nikto, enum4linux) and Windows host telemetry
+(Sysmon XML, Windows Event Log XML) flow into the same unified Pearl stream
+and are classified together.
 
 Quick start — autonomous
 -------------------------
     from lab_session import LabSession
 
     lab = LabSession(workload_id="lab-01", node_key="192.168.1.50")
-    lab.engage("192.168.1.50")          # Invar runs nmap → enum4linux → nikto
+    lab.engage("192.168.1.50")          # nmap → enum4linux → nikto
+    lab.next_actions()                  # Invar tells you what comes next
     lab.status()
 
 Quick start — operator-fed
 ---------------------------
     lab = LabSession(workload_id="lab-01", node_key="192.168.1.50")
-
-    # Run tools yourself; paste or pipe output in:
-    lab.ingest_nmap(open("scan.xml").read())
-    lab.ingest_enum4linux(enum_output)
+    lab.ingest_nmap(xml_str)
+    lab.ingest_sysmon(sysmon_xml)       # Sysmon events from the host
+    lab.next_actions()
     lab.status()
 
-    # Post-exploitation output (mimikatz, PowerUp) — operator retrieves, Invar structures:
+    # Post-exploitation output (mimikatz, PowerUp, msf):
     lab.receive("mimikatz", mimi_output, target="192.168.1.50")
-    lab.receive("powerup",  pu_output,   target="192.168.1.50")
-    lab.status()
+    lab.next_actions()
 
 Engagement phases (autonomous)
 --------------------------------
     Phase 1 — Port discovery     : nmap -sV -sC -T4 --open
-    Phase 2 — SMB enumeration    : enum4linux -a  (if port 445 or 139 open)
-    Phase 3 — Web enumeration    : nikto -h       (if port 80/443/8080/8443 open)
-    (Post-exploitation phases are operator-driven via receive())
+    Phase 2 — SMB enumeration    : enum4linux -a  (if port 445/139 observed)
+    Phase 3 — Web enumeration    : nikto -h       (if port 80/443/8080/8443 observed)
+    Post-exploitation            : operator-driven via receive()
 
 State inspection
 -----------------
-    lab.status()              print engagement summary to stdout
-    lab.pearls()              List[Pearl] — all emitted Pearls
-    lab.cycle_ids()           List[str]  — observed cycles in order
-    lab.pattern_matches()     detected multi-cycle attack patterns
-    lab.driver.run_log()      full audit trail of tool invocations
-    lab.driver.available_tools()  which tools are on PATH
+    lab.status()                print full engagement summary
+    lab.next_actions()          print prioritized recommendations
+    lab.pearls()                List[Pearl] — all Pearls (tools + Sysmon unified)
+    lab.cycle_ids()             List[str]  — observed cycles in order
+    lab.pattern_matches()       detected multi-cycle attack patterns
+    lab.driver.run_log()        audit trail of tool invocations
+    lab.driver.available_tools()  which recon tools are on PATH
 """
 from __future__ import annotations
 
@@ -48,6 +53,7 @@ import time
 from typing import List, Optional
 
 from invar.adapters.measurement.instrument_driver import InstrumentDriver
+from invar.adapters.measurement.next_action import NextAction, NextActionEngine
 from invar.adapters.measurement.tool_normalizer import MeasurementAdapter
 from invar.adapters.redteam.acknowledgment import AcknowledgmentStore
 from invar.adapters.redteam.action_proposal import ActionProposalEngine
@@ -58,6 +64,7 @@ from invar.adapters.redteam.domain_model import (
 from invar.adapters.redteam.feedback import FeedbackEngine
 from invar.adapters.redteam.observer import RedTeamObserver
 from invar.adapters.redteam.relationship_graph import RelationshipGraph
+from invar.adapters.redteam.windows_ingest import WindowsIngestAdapter
 from invar.adapters.redteam.workflow import WorkflowView
 from invar.core.support_engine import Pearl
 from invar.persistence.causal_field import CausalField
@@ -66,18 +73,19 @@ from invar.persistence.pearl_archive import PearlArchive
 from invar.persistence.proto_causality import ProtoCausality
 from invar.persistence.temporal_graph import TemporalGraph
 
-# Ports whose presence in nmap Pearls triggers follow-on tools
-_SMB_PORTS  = {"445", "139"}
-_WEB_PORTS  = {"80", "443", "8080", "8443", "8000", "8888"}
+_SMB_PORTS = {"445", "139"}
+_WEB_PORTS = {"80", "443", "8080", "8443", "8000", "8888"}
+
+_PRIORITY_LABEL = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
 
 
 class LabSession:
     """
     Black-box engagement session.
 
-    Invar is the primary measurement driver.  The operator is a second observer
-    who can supply additional context via receive() or direct ingest_*() calls
-    at any point.
+    A single PearlArchive is shared across MeasurementAdapter (tool output)
+    and WindowsIngestAdapter (Sysmon/WEL telemetry) so that all signals are
+    classified and pattern-matched together.
     """
 
     def __init__(
@@ -93,13 +101,19 @@ class LabSession:
         self._node_key    = node_key
         self._verbose     = verbose
 
+        # Each adapter owns its archive; LabSession merges by timestamp for observation
         self._adapter = MeasurementAdapter(
             workload_id=workload_id,
             node_key=node_key,
             gap_threshold=gap_threshold,
             shift_window=shift_window,
         )
-        self._archive: PearlArchive = self._adapter._archive
+        self._sysmon = WindowsIngestAdapter(
+            workload_id=workload_id,
+            node_key=node_key,
+            gap_threshold=gap_threshold,
+            shift_window=shift_window,
+        )
         self.driver = InstrumentDriver(
             adapter=self._adapter,
             timeout=timeout,
@@ -121,15 +135,11 @@ class LabSession:
         Run a full measurement sequence against target.
 
         Phase 1: nmap port/service/OS discovery
-        Phase 2: SMB enumeration (enum4linux) if port 445 or 139 found
+        Phase 2: SMB enumeration (enum4linux) if port 445/139 found
         Phase 3: Web enumeration (nikto) for each web port found
-
-        After each phase, calls status() so the operator sees current state.
-        Operator may call receive() at any point to inject additional data.
         """
         self._banner(f"ENGAGE — {target}")
 
-        # Phase 1: port discovery
         self._phase("1 — Port discovery (nmap)")
         nmap_pearls = self.driver.run_nmap(
             target, ports=ports, flags=nmap_flags,
@@ -137,52 +147,37 @@ class LabSession:
         )
         self.status()
 
-        # Derive open ports from emitted Pearls
         open_ports = _open_ports_from_pearls(nmap_pearls)
         if self._verbose and open_ports:
             print(f"[engage] open ports observed: {sorted(open_ports)}")
 
-        # Phase 2: SMB
         if open_ports & _SMB_PORTS:
             self._phase("2 — SMB enumeration (enum4linux)")
-            self.driver.run_enum4linux(
-                target,
-                cycle_id=f"{cycle_prefix}-02-enum",
-            )
+            self.driver.run_enum4linux(target, cycle_id=f"{cycle_prefix}-02-enum")
             self.status()
-        else:
-            if self._verbose:
-                print("[engage] phase 2 skipped — no SMB ports observed")
+        elif self._verbose:
+            print("[engage] phase 2 skipped — no SMB ports observed")
 
-        # Phase 3: web
         web = open_ports & _WEB_PORTS
         if web:
             self._phase(f"3 — Web enumeration (nikto) ports={sorted(web)}")
             for port in sorted(web, key=int):
-                ssl = port in ("443", "8443")
                 self.driver.run_nikto(
-                    target, port=int(port), ssl=ssl,
+                    target, port=int(port), ssl=(port in ("443", "8443")),
                     cycle_id=f"{cycle_prefix}-03-web",
                 )
             self.status()
-        else:
-            if self._verbose:
-                print("[engage] phase 3 skipped — no web ports observed")
+        elif self._verbose:
+            print("[engage] phase 3 skipped — no web ports observed")
 
         self._banner("ENGAGE COMPLETE")
-        self.status()
+        self.next_actions()
 
     # ------------------------------------------------------------------
-    # Operator entry points (direct ingest or receive)
+    # Tool output — operator or driver
     # ------------------------------------------------------------------
 
-    def ingest(
-        self,
-        source:   str,
-        raw:      str,
-        cycle_id: Optional[str] = None,
-        target:   str           = "",
-    ) -> List[Pearl]:
+    def ingest(self, source: str, raw: str, cycle_id: Optional[str] = None, target: str = "") -> List[Pearl]:
         return self._adapter.ingest(source, raw, cycle_id, target)
 
     def ingest_nmap(self, xml_str: str, cycle_id: Optional[str] = None, target: str = "") -> List[Pearl]:
@@ -203,17 +198,28 @@ class LabSession:
     def ingest_msf(self, text: str, cycle_id: Optional[str] = None, target: str = "") -> List[Pearl]:
         return self._adapter.ingest_msf(text, cycle_id, target)
 
-    def receive(
-        self,
-        source:   str,
-        content:  str,
-        target:   str           = "",
-        cycle_id: Optional[str] = None,
-    ) -> List[Pearl]:
+    # ------------------------------------------------------------------
+    # Sysmon / Windows Event Log — host telemetry
+    # ------------------------------------------------------------------
+
+    def ingest_sysmon(self, xml_str: str, cycle_id: Optional[str] = None) -> List[Pearl]:
+        """
+        Ingest Sysmon XML from the target host.
+
+        Accepts a single <Event> element, an <Events> container, or a raw
+        Sysmon XML string as produced by Get-WinEvent | ConvertTo-Xml.
+        Pearls flow into the same archive as tool output.
+        """
+        return self._sysmon.ingest_sysmon_xml(xml_str, cycle_id)
+
+    def ingest_event_log(self, xml_str: str, cycle_id: Optional[str] = None) -> List[Pearl]:
+        """Ingest Windows Security Event Log XML (4688, 4624, 4698 fallback)."""
+        return self._sysmon.ingest_event_log_xml(xml_str, cycle_id)
+
+    def receive(self, source: str, content: str, target: str = "", cycle_id: Optional[str] = None) -> List[Pearl]:
         """
         Accept operator-retrieved or C2-pulled tool output.
 
-        Use for post-exploitation tools that run on the target:
             lab.receive("mimikatz", mimi_output, target="192.168.1.50")
             lab.receive("powerup",  pu_output,   target="192.168.1.50")
             lab.receive("msf",      msf_output)
@@ -225,11 +231,14 @@ class LabSession:
     # ------------------------------------------------------------------
 
     def pearls(self) -> List[Pearl]:
-        return self._adapter.pearls()
+        """All Pearls — tool output and Sysmon telemetry unified, sorted by timestamp."""
+        return PearlArchive.merge(
+            self._adapter._archive, self._sysmon._archive
+        ).pearls
 
     def cycle_ids(self) -> List[str]:
         seen: list = []
-        for p in self._adapter.pearls():
+        for p in self.pearls():
             if p.cycle_id not in seen:
                 seen.append(p.cycle_id)
         return seen
@@ -240,11 +249,42 @@ class LabSession:
         return RelationshipGraph(observer, model).pattern_matches()
 
     # ------------------------------------------------------------------
+    # Intelligence
+    # ------------------------------------------------------------------
+
+    def next_actions(self) -> List[NextAction]:
+        """
+        Print and return prioritized next-action recommendations.
+
+        Invar derives recommendations from the current Pearl set — what has
+        been observed, what gaps remain, what attack patterns are emerging.
+        """
+        actions = NextActionEngine(self.pearls()).recommendations()
+
+        print()
+        print("─" * 64)
+        print("  INVAR NEXT ACTIONS")
+        print("─" * 64)
+        if not actions:
+            print("  No further actions recommended — engagement complete or insufficient data.")
+        for a in actions:
+            label = _PRIORITY_LABEL.get(a.priority, str(a.priority))
+            print(f"\n  [{label}] {a.phase.upper()}: {a.action}")
+            print(f"    tool   : {a.tool}")
+            print(f"    cmd    : {a.command}")
+            print(f"    why    : {a.reason}")
+            if a.targets:
+                print(f"    targets: {a.targets}")
+        print()
+
+        return actions
+
+    # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
 
     def status(self) -> None:
-        """Print engagement state to stdout."""
+        """Print full engagement state to stdout."""
         pearls = self.pearls()
         if not pearls:
             print("[lab] No data ingested yet.")
@@ -255,10 +295,16 @@ class LabSession:
         graph    = RelationshipGraph(observer, model)
         cycles   = self.cycle_ids()
 
+        # Count Sysmon vs tool Pearls
+        sysmon_p = [p for p in pearls if p.instrument_id.startswith(("sysmon_", "wel_"))]
+        tool_p   = [p for p in pearls if not p.instrument_id.startswith(("sysmon_", "wel_"))]
+
         print()
         print("=" * 64)
         print(f"  INVAR  {self._workload_id}  |  target: {self._node_key}")
-        print(f"  Pearls: {len(pearls)}   Cycles: {len(cycles)}")
+        print(f"  Pearls: {len(pearls)}  "
+              f"(tools: {len(tool_p)}  sysmon/WEL: {len(sysmon_p)})  "
+              f"Cycles: {len(cycles)}")
         print("=" * 64)
 
         for cid in cycles:
@@ -271,17 +317,18 @@ class LabSession:
             print(f"\n  [{cid}]")
             print(f"    Primitive : {prim}")
             print(f"    Nodes     : {nodes}")
-            print(f"    Pearls    : {len(cycle_pearls)}   Artifact types: {', '.join(art_types)}")
+            print(f"    Pearls    : {len(cycle_pearls)}   "
+                  f"Artifact types: {', '.join(art_types)}")
             for g in gate_ids:
                 atype  = classify_gate_id(g)
                 gnodes = sorted({p.node_key for p in cycle_pearls if p.gate_id == g})
-                print(f"      {g:<42}  [{atype}]  {gnodes}")
+                print(f"      {g:<44}  [{atype}]  {gnodes}")
 
         matches = graph.pattern_matches()
         if matches:
             print(f"\n  Attack Patterns detected ({len(matches)}):")
             for m in matches:
-                print(f"    {m.pattern_name:<38}  {' → '.join(m.cycle_sequence)}")
+                print(f"    {m.pattern_name:<40}  {' → '.join(m.cycle_sequence)}")
         else:
             print("\n  Attack Patterns: none detected yet")
 
@@ -296,10 +343,10 @@ class LabSession:
             print(f"\n  Tool Run Log ({len(log)} invocations):")
             for run in log:
                 ts_str = time.strftime("%H:%M:%S", time.localtime(run.ts))
-                status = "ok" if run.ok else f"exit={run.exit_code}"
+                st     = "ok" if run.ok else f"exit={run.exit_code}"
                 note   = f"  [{run.note}]" if run.note else ""
-                print(f"    {ts_str}  {run.source:<12}  {run.target:<20}  {status}  {run.pearls} pearls{note}")
-
+                print(f"    {ts_str}  {run.source:<12}  {run.target:<22}  "
+                      f"{st}  {run.pearls} pearls{note}")
         print()
 
     # ------------------------------------------------------------------
@@ -307,25 +354,24 @@ class LabSession:
     # ------------------------------------------------------------------
 
     def _build_observer(self) -> RedTeamObserver:
-        pearls  = self.pearls()
+        merged   = PearlArchive.merge(self._adapter._archive, self._sysmon._archive)
+        pearls   = merged.pearls
         temporal = TemporalGraph.build(pearls)
         windows  = ExecutionWindows.build(pearls)
         causal   = ProtoCausality.build(windows)
         field    = CausalField.build(causal, windows)
-        return RedTeamObserver(self._archive, temporal, windows, causal, field)
+        return RedTeamObserver(merged, temporal, windows, causal, field)
 
     def _build_domain_model(self, observer: RedTeamObserver) -> RedTeamDomainModel:
-        store        = AcknowledgmentStore()
-        feedback     = FeedbackEngine(observer)
-        workflow     = WorkflowView(feedback, store)
+        store         = AcknowledgmentStore()
+        feedback      = FeedbackEngine(observer)
+        workflow      = WorkflowView(feedback, store)
         action_engine = ActionProposalEngine(feedback, store)
         return RedTeamDomainModel(observer, feedback, store, workflow, action_engine)
 
     def _banner(self, msg: str) -> None:
         if self._verbose:
-            print(f"\n{'─' * 64}")
-            print(f"  {msg}")
-            print(f"{'─' * 64}")
+            print(f"\n{'─' * 64}\n  {msg}\n{'─' * 64}")
 
     def _phase(self, msg: str) -> None:
         if self._verbose:
@@ -337,27 +383,17 @@ class LabSession:
 # ---------------------------------------------------------------------------
 
 def _open_ports_from_pearls(pearls: List[Pearl]) -> set:
-    """
-    Derive the set of open port strings from nmap gate_ids in a Pearl list.
-
-    Multiple ports share one gate_id (e.g. 445 and 139 both → discover_nmap_445).
-    We build a one-to-many gate→ports map so all ports are represented.
-    discover_nmap_port_<N> gate_ids are parsed directly.
-    """
     from invar.adapters.measurement.tool_normalizer import _NMAP_PORT_GATE
-
-    # Build gate → {ports} one-to-many map
     gate_to_ports: dict = {}
     for port, gate in _NMAP_PORT_GATE.items():
         gate_to_ports.setdefault(gate, set()).add(port)
-
     ports: set = set()
     for p in pearls:
         gid = p.gate_id
         if gid in gate_to_ports:
             ports.update(gate_to_ports[gid])
         elif gid.startswith("discover_nmap_port_"):
-            port_str = gid[len("discover_nmap_port_"):]
-            if port_str.isdigit():
-                ports.add(port_str)
+            s = gid[len("discover_nmap_port_"):]
+            if s.isdigit():
+                ports.add(s)
     return ports

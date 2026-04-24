@@ -130,6 +130,34 @@ class PearlArchive:
         self._restore_gates(engine)
 
     # ------------------------------------------------------------------
+    # Multi-adapter merge
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def merge(cls, *archives: "PearlArchive") -> "PearlArchive":
+        """
+        Merge multiple independent archives into one sorted by timestamp.
+
+        Used when parallel adapters (e.g. MeasurementAdapter and
+        WindowsIngestAdapter) each maintain their own archive with
+        independently monotone seq_ids.  The merged archive assigns new
+        seq_ids in ascending timestamp order so the monotone invariant is
+        satisfied on the combined record.
+
+        The source archives are not modified.
+        """
+        all_pearls = sorted(
+            (p for a in archives for p in a._pearls),
+            key=lambda p: (p.ts, p.seq_id),
+        )
+        merged = cls()
+        for i, pearl in enumerate(all_pearls, start=1):
+            from dataclasses import replace
+            merged._pearls.append(replace(pearl, seq_id=i))
+            merged._last_seq = i
+        return merged
+
+    # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 

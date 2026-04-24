@@ -475,9 +475,9 @@ class WindowsIngestAdapter:
     def __init__(
         self,
         workload_id:   str,
-        node_key:      Optional[str] = None,
-        gap_threshold: float         = 300.0,
-        shift_window:  int           = 5,
+        node_key:      Optional[str]  = None,
+        gap_threshold: float          = 300.0,
+        shift_window:  int            = 5,
     ) -> None:
         self._workload_id = workload_id
         self._node_key    = node_key
