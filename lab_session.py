@@ -132,46 +132,48 @@ class LabSession:
         nmap_flags:   Optional[str] = None,
     ) -> None:
         """
-        Run a full measurement sequence against target.
+        Autonomous engagement loop.
 
-        Phase 1: nmap port/service/OS discovery
-        Phase 2: SMB enumeration (enum4linux) if port 445/139 found
-        Phase 3: Web enumeration (nikto) for each web port found
+        INVAR runs every instrument it can reach from its network position
+        without stopping or asking.  Phases execute immediately in sequence;
+        each phase's Pearl output drives the next decision.
+
+        The loop stops exactly once — at the end — to surface:
+          - What was observed (status)
+          - What entropy remains that requires operator action or a foothold
+            INVAR cannot reach (next_actions / decision surface)
+
+        The operator's terminal shows INVAR working, not waiting.
+        The only inputs the operator should ever supply:
+          - Post-exploitation output from tools running on the target
+            (mimikatz, PowerUp, msf sessions) that require a foothold
+          - Authorization for exploitation actions
+          - Redirection when the field isn't pointing where they need it
         """
-        self._banner(f"ENGAGE — {target}")
+        self._banner(f"ENGAGE {target}")
 
-        self._phase("1 — Port discovery (nmap)")
+        # Port discovery — always first
         nmap_pearls = self.driver.run_nmap(
             target, ports=ports, flags=nmap_flags,
             cycle_id=f"{cycle_prefix}-01-recon",
         )
-        self.status()
-
         open_ports = _open_ports_from_pearls(nmap_pearls)
-        if self._verbose and open_ports:
-            print(f"[engage] open ports observed: {sorted(open_ports)}")
 
+        # SMB enumeration — immediate if 445 or 139 observed, no pause
         if open_ports & _SMB_PORTS:
-            self._phase("2 — SMB enumeration (enum4linux)")
             self.driver.run_enum4linux(target, cycle_id=f"{cycle_prefix}-02-enum")
-            self.status()
-        elif self._verbose:
-            print("[engage] phase 2 skipped — no SMB ports observed")
 
-        web = open_ports & _WEB_PORTS
-        if web:
-            self._phase(f"3 — Web enumeration (nikto) ports={sorted(web)}")
-            for port in sorted(web, key=int):
-                self.driver.run_nikto(
-                    target, port=int(port), ssl=(port in ("443", "8443")),
-                    cycle_id=f"{cycle_prefix}-03-web",
-                )
-            self.status()
-        elif self._verbose:
-            print("[engage] phase 3 skipped — no web ports observed")
+        # Web enumeration — immediate for every web port observed, no pause
+        for port in sorted(open_ports & _WEB_PORTS, key=int):
+            self.driver.run_nikto(
+                target, port=int(port), ssl=(port in ("443", "8443")),
+                cycle_id=f"{cycle_prefix}-03-web",
+            )
 
-        self._banner("ENGAGE COMPLETE")
-        self.next_actions()
+        # All instruments reachable from this position are exhausted.
+        # Show what was observed, then surface what entropy remains.
+        self.status()
+        self._surface_decision(target)
 
     # ------------------------------------------------------------------
     # Tool output — operator or driver
@@ -369,13 +371,57 @@ class LabSession:
         action_engine = ActionProposalEngine(feedback, store)
         return RedTeamDomainModel(observer, feedback, store, workflow, action_engine)
 
+    def _surface_decision(self, target: str = "") -> None:
+        """
+        The single point where INVAR stops and surfaces to the operator.
+
+        Called when all instruments reachable from INVAR's network position
+        are exhausted.  Separates what INVAR observed from what requires
+        the operator: foothold access, post-exploitation tools, or
+        explicit authorization to cross from observation into exploitation.
+        """
+        actions = NextActionEngine(self.pearls()).recommendations()
+        if not actions:
+            self._banner("ENGAGEMENT COMPLETE — no further entropy detected")
+            return
+
+        # Actions INVAR can drive autonomously (additional recon/enum tools)
+        # vs. actions that require operator input or foothold
+        _INVAR_PHASES    = {"recon", "enum"}
+        _OPERATOR_PHASES = {"cred", "lateral", "privesc", "persist", "collect"}
+
+        invar_actions    = [a for a in actions if a.phase in _INVAR_PHASES]
+        operator_actions = [a for a in actions if a.phase in _OPERATOR_PHASES]
+
+        self._banner("INVAR DECISION SURFACE")
+
+        if invar_actions:
+            print("  Additional instruments available from this position:")
+            for a in invar_actions:
+                print(f"    [{a.tool}]  {a.action}")
+                print(f"             {a.command}")
+            print()
+
+        if operator_actions:
+            print("  Entropy remains — requires operator action or foothold:")
+            print()
+            for a in operator_actions:
+                label = _PRIORITY_LABEL.get(a.priority, str(a.priority))
+                print(f"  [{label}] {a.phase.upper()}: {a.action}")
+                print(f"    tool : {a.tool}")
+                print(f"    cmd  : {a.command}")
+                print(f"    why  : {a.reason}")
+                print()
+            print("  When you have output:")
+            print(f"    lab.receive('mimikatz', text, target='{target or self._node_key}')")
+            print(f"    lab.receive('powerup',  text, target='{target or self._node_key}')")
+            print(f"    lab.receive('msf',      text)")
+            print(f"    lab.next_actions()  # recomputes from new state")
+        print()
+
     def _banner(self, msg: str) -> None:
         if self._verbose:
             print(f"\n{'─' * 64}\n  {msg}\n{'─' * 64}")
-
-    def _phase(self, msg: str) -> None:
-        if self._verbose:
-            print(f"\n[engage] Phase {msg}")
 
 
 # ---------------------------------------------------------------------------
